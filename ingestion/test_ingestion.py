@@ -1,34 +1,50 @@
 import os
 import shutil
 import boto3
+from botocore.exceptions import ClientError
 import fitz  # PyMuPDF
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import Chroma
-from langchain.embeddings import OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.schema import Document
 from dotenv import load_dotenv
+import botocore.exceptions
 
 load_dotenv()
 
-AWS_BUCKET = os.getenv("AWS_BUCKET_NAME")
-VECTOR_DIR = os.path.join(os.path.dirname(__file__), "../vector_store")
-PDF_KEY = "test/test-file.pdf"  # Cambia esto por otro archivo si lo deseas
+AWS_BUCKET = os.getenv("BUCKET_TEST_NAME")
+VECTOR_DIR = os.path.join(os.path.dirname(__file__), "../vector-store")
+PDF_KEY = "Oscar Casas Resume.pdf"  # Cambia esto por otro archivo si lo deseas
 
 text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-embedding_function = OpenAIEmbeddings()
+embedding = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 s3 = boto3.client("s3")
+print("BUCKET_TEST_NAME desde .env:", AWS_BUCKET)
 
 def clean_vector_store():
-    if os.path.exists(VECTOR_DIR):
-        print(f"🧹 Eliminando base vectorial anterior en '{VECTOR_DIR}'...")
-        shutil.rmtree(VECTOR_DIR)
+    print("🧹 Eliminando colección anterior de la base vectorial...")
+    try:
+        if os.path.exists(VECTOR_DIR):
+            shutil.rmtree(VECTOR_DIR)
+            print("✅ Directorio de vector store eliminado exitosamente.")
+        else:
+            print("ℹ️ No existe directorio anterior para eliminar.")
+    except Exception as e:
+        print(f"⚠️ Error al limpiar vector store: {e}")
+        # Crear el directorio si no existe
+        os.makedirs(VECTOR_DIR, exist_ok=True)
 
 def process_test_pdf(key):
     try:
         print("📥 Descargando PDF desde S3...")
         obj = s3.get_object(Bucket=AWS_BUCKET, Key=key)
-        data = obj["Body"].read()
-        pdf = fitz.open(stream=data, filetype="pdf")
+        with obj["Body"] as body_stream:
+            data = body_stream.read()
+            print(f"Tipo de 'data': {type(data)}")
+            print(f"Primeros 100 bytes: {data[:100]}")
+            if not isinstance(data, (bytes, bytearray)):
+                raise ValueError("El contenido descargado no es de tipo bytes.")
+            pdf = fitz.open(stream=data, filetype="pdf")
 
         full_text = ""
         for page in pdf:
@@ -42,20 +58,31 @@ def process_test_pdf(key):
         chunks = text_splitter.split_text(full_text)
         print(f"\n✅ Fragmentos generados: {len(chunks)}\n")
 
-        preview_limit = 3
-        for i, chunk in enumerate(chunks[:preview_limit]):
+        for i, chunk in enumerate(chunks[:3]):
             print(f"📄 Fragmento {i + 1}:\n{'-'*40}\n{chunk[:500]}\n{'-'*40}\n")
 
         docs = [Document(page_content=chunk, metadata={"source": key}) for chunk in chunks]
 
-        clean_vector_store()  # 🧼 Limpia antes de guardar
+        clean_vector_store()
 
         print("💾 Guardando en nueva base ChromaDB...")
-        Chroma.from_documents(docs, embedding_function, persist_directory=VECTOR_DIR).persist()
+        db = Chroma.from_documents(docs, embedding=embedding, persist_directory=VECTOR_DIR)
+        # La persistencia es automática cuando se especifica persist_directory
+        # No es necesario llamar db.persist()
 
-        print("\n✅ Proceso de prueba finalizado exitosamente.\n")
+        print("\n✅ Proceso finalizado exitosamente.\n")
+
+    except ClientError as e:
+        print("❌ Error al acceder a S3:")
+        print("Código de error:", e.response['Error']['Code'])
+        print("Mensaje:", e.response['Error']['Message'])
+        print("Request ID:", e.response['ResponseMetadata']['RequestId'])
+        print("Host ID:", e.response['ResponseMetadata']['HostId'])
+        raise
+
     except Exception as e:
-        print(f"❌ Error procesando el archivo de prueba: {e}")
+        print("❌ Otro error ocurrió:", str(e))
+        raise
 
 if __name__ == "__main__":
     process_test_pdf(PDF_KEY)
